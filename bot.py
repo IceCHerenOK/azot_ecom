@@ -1203,12 +1203,17 @@ def main():
         # Считаем задержку до ближайших 8:00 МСК и дальше каждые 24 часа.
         now_utc = datetime.now(timezone.utc)
         now_msk = now_utc + timedelta(hours=3)
+
         today_msk = now_msk.date()
-        first_run_msk = datetime.combine(today_msk, datetime.min.time()).replace(
-            hour=8, minute=0
+        # делаем first_run_msk тоже "aware" с тем же tzinfo, что и now_msk
+        first_run_msk = datetime.combine(
+            today_msk,
+            dtime(hour=8, minute=0, tzinfo=now_msk.tzinfo),
         )
+
         if now_msk >= first_run_msk:
             first_run_msk += timedelta(days=1)
+
         delay_seconds = (first_run_msk - now_msk).total_seconds()
 
         app.job_queue.run_repeating(
@@ -1220,6 +1225,7 @@ def main():
         logger.warning(
             "JobQueue не инициализировался — фоновые задачи работать не будут."
         )
+
 
     app.run_polling()
 
