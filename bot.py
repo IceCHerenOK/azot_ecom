@@ -25,6 +25,36 @@ from gs_client import get_cost_by_article, get_unit_economy_by_article
 # ================== WHITELIST ==================
 
 WHITELIST_FILE = "allowed_users.json"
+PLAN_FILE = "sales_plan.json"
+
+
+def load_plans():
+    if not os.path.exists(PLAN_FILE):
+        return {}
+    try:
+        with open(PLAN_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_plans(plans: dict):
+    with open(PLAN_FILE, "w", encoding="utf-8") as f:
+        json.dump(plans, f, ensure_ascii=False, indent=2)
+
+
+plans = load_plans()
+
+
+def set_plan_for_date(target_date: date, value: float):
+    key = target_date.isoformat()
+    plans[key] = value
+    save_plans(plans)
+
+
+def get_plan_for_date(target_date: date) -> float | None:
+    return plans.get(target_date.isoformat())
+
 
 
 def load_whitelist():
@@ -473,6 +503,107 @@ async def check_fbs_orders_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Failed to send FBS notification: {e}")
 
+def _get_msk_yesterday() -> date:
+    """
+    Возвращает вчерашнюю дату по МСК.
+    Сервер живёт в UTC/CET, поэтому руками смещаем время на +3 часа.
+    """
+    now_utc = datetime.now(timezone.utc)
+    now_msk = now_utc + timedelta(hours=3)
+    yesterday_msk = (now_msk - timedelta(days=1)).date()
+    return yesterday_msk
+
+
+async def daily_finance_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Раз в день считает выручку и EBITDA за прошедшие 24 часа
+    (приближенно к календарному дню по МСК) на основе FBS-заказов + юнит-экономики.
+    """
+    global ADMIN_CHAT_ID
+    if not ADMIN_CHAT_ID:
+        return
+
+    target_date = _get_msk_yesterday()
+
+    # Берём заказы за последние 1 день (как и в ручном отчёте)
+    result = fetch_fbs_orders_grouped(1)
+    if not result["ok"]:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"⚠ Ошибка при получении заказов для ежедневного отчёта: {result['error']}",
+        )
+        return
+
+    summary = calc_ebitda_summary_from_grouped(result["data"])
+    offer_stats = summary["offer_stats"]
+
+    # План по выручке на дату (если задан)
+    plan_value = get_plan_for_date(target_date)
+    fact_revenue = summary["total_revenue"]
+    if plan_value and plan_value > 0:
+        plan_percent = fact_revenue / plan_value * 100
+    else:
+        plan_percent = None
+
+    # Сколько товаров в плюсе/минусе
+    positive = [s for s in offer_stats.values() if s["ebitda_total"] > 0]
+    negative = [s for s in offer_stats.values() if s["ebitda_total"] < 0]
+
+    # Топы
+    top_pos = sorted(
+        offer_stats.items(),
+        key=lambda kv: kv[1]["ebitda_total"],
+        reverse=True,
+    )
+    top_pos = [kv for kv in top_pos if kv[1]["ebitda_total"] > 0][:5]
+
+    top_neg = sorted(
+        offer_stats.items(),
+        key=lambda kv: kv[1]["ebitda_total"],
+    )
+    top_neg = [kv for kv in top_neg if kv[1]["ebitda_total"] < 0][:5]
+
+    lines = [
+        f"📊 Финансовый отчёт Ozon за {target_date.isoformat()}",
+        "",
+        f"Выручка: {summary['total_revenue']:.2f} ₽",
+        f"Себестоимость: {summary['total_cost']:.2f} ₽",
+        f"Комиссия: {summary['total_commission']:.2f} ₽",
+        f"Логистика: {summary['total_logistics']:.2f} ₽",
+        f"Хранение: {summary['total_storage']:.2f} ₽",
+        f"Доп. расходы: {summary['total_extra']:.2f} ₽",
+        f"<b>EBITDA: {summary['total_ebitda']:.2f} ₽</b>",
+        "",
+        f"Товаров в плюсе: {len(positive)}",
+        f"Товаров в минусе: {len(negative)}",
+    ]
+
+    if plan_value is not None:
+        lines.append("")
+        lines.append("<b>План / Факт по выручке:</b>")
+        lines.append(f"План: {plan_value:.2f} ₽")
+        lines.append(f"Факт: {fact_revenue:.2f} ₽")
+        if plan_percent is not None:
+            lines.append(f"Выполнение: {plan_percent:.1f}%")
+
+    if top_pos:
+        lines.append("")
+        lines.append("Топ прибыльных товаров:")
+        for offer_id, st in top_pos:
+            lines.append(
+                f" • {offer_id} · {st['name']} — EBITDA {st['ebitda_total']:.2f} ₽ ({st['qty']} шт)"
+            )
+
+    if top_neg:
+        lines.append("")
+        lines.append("Топ убыточных товаров:")
+        for offer_id, st in top_neg:
+            lines.append(
+                f" • {offer_id} · {st['name']} — EBITDA {st['ebitda_total']:.2f} ₽ ({st['qty']} шт)"
+            )
+
+    text = "\n".join(lines)
+    await send_long_html_message(ADMIN_CHAT_ID, text, context)
 
 # ================== ОТЧЁТ ПО ЗАКАЗАМ ЗА ПЕРИОД ==================
 
@@ -534,6 +665,78 @@ def fetch_fbs_orders_grouped(days: int):
             g["qty"] += qty
 
     return {"ok": True, "data": grouped}
+
+def calc_ebitda_summary_from_grouped(grouped_data: dict):
+    """
+    Использует те же поля юнит-экономики, что и format_orders_report.
+    Возвращает:
+      - суммарные показатели
+      - статистику по каждому offer_id
+    """
+    total_revenue = 0.0
+    total_cost = 0.0
+    total_commission = 0.0
+    total_logistics = 0.0
+    total_storage = 0.0
+    total_extra = 0.0
+    total_ebitda = 0.0
+
+    offer_stats: dict[str, dict] = {}
+
+    for offer_id, info in grouped_data.items():
+        name = info["name"]
+        qty = info["qty"]
+
+        ue = get_unit_economy_by_article(offer_id)
+        if ue is None:
+            # пропускаем позиции, которых нет в юнит-экономике
+            continue
+
+        sell_price = ue.get("sell_price") or 0.0
+        commission_per_unit = ue.get("commission") or 0.0  # руб/шт, столбец L
+        logistics = ue.get("logistics") or 0.0
+        storage = ue.get("storage") or 0.0
+        extra = ue.get("extra") or 0.0
+        cost = ue.get("cost") or 0.0
+
+        revenue = sell_price * qty
+
+        commission_total = commission_per_unit * qty
+        logistics_total = logistics * qty
+        storage_total = storage * qty
+        extra_total = extra * qty
+        cost_total = cost * qty
+
+        ebitda_unit = sell_price - (
+            commission_per_unit + logistics + storage + extra + cost
+        )
+        ebitda_total = ebitda_unit * qty
+
+        total_revenue += revenue
+        total_cost += cost_total
+        total_commission += commission_total
+        total_logistics += logistics_total
+        total_storage += storage_total
+        total_extra += extra_total
+        total_ebitda += ebitda_total
+
+        offer_stats[offer_id] = {
+            "name": name,
+            "qty": qty,
+            "revenue": revenue,
+            "ebitda_total": ebitda_total,
+        }
+
+    return {
+        "total_revenue": total_revenue,
+        "total_cost": total_cost,
+        "total_commission": total_commission,
+        "total_logistics": total_logistics,
+        "total_storage": total_storage,
+        "total_extra": total_extra,
+        "total_ebitda": total_ebitda,
+        "offer_stats": offer_stats,
+    }
 
 
 def format_orders_report(days: int, grouped_data: dict) -> str:
@@ -886,6 +1089,87 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Нажми /start или /menu и выбери действие.",
         )
 
+async def setplan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # проверяем доступ
+    if not is_allowed(update):
+        return await deny_access(update, context)
+
+    args = context.args
+
+    if not args:
+        return await update.message.reply_text(
+            "Использование:\n"
+            "/setplan <сумма> — план на сегодня\n"
+            "/setplan YYYY-MM-DD <сумма> — план на дату"
+        )
+
+    # вариант без даты: /setplan 100000
+    if len(args) == 1:
+        target_date = date.today()
+        amount_str = args[0]
+    else:
+        try:
+            target_date = datetime.strptime(args[0], "%Y-%m-%d").date()
+        except ValueError:
+            return await update.message.reply_text(
+                "Дата должна быть в формате YYYY-MM-DD"
+            )
+        amount_str = args[1]
+
+    try:
+        plan_value = float(amount_str.replace(",", "."))
+    except ValueError:
+        return await update.message.reply_text("Сумма плана должна быть числом.")
+
+    set_plan_for_date(target_date, plan_value)
+    await update.message.reply_text(
+        f"✅ План по выручке на {target_date.isoformat()} установлен: {plan_value:.2f} ₽"
+    )
+
+
+async def getplan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return await deny_access(update, context)
+
+    args = context.args
+    if args:
+        try:
+            target_date = datetime.strptime(args[0], "%Y-%m-%d").date()
+        except ValueError:
+            return await update.message.reply_text(
+                "Дата должна быть в формате YYYY-MM-DD"
+            )
+    else:
+        target_date = date.today()
+
+    plan_value = get_plan_for_date(target_date)
+    if plan_value is None:
+        await update.message.reply_text(
+            f"На {target_date.isoformat()} план не задан."
+        )
+    else:
+        await update.message.reply_text(
+            f"План по выручке на {target_date.isoformat()}: {plan_value:.2f} ₽"
+        )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return await deny_access(update, context)
+
+    text = (
+        "Доступные команды:\n"
+        "/start – запуск и главное меню\n"
+        "/menu – показать меню\n"
+        "/help – список команд\n"
+        "/adduser <username> – добавить пользователя (только владелец)\n"
+        "/setplan <сумма> – установить план выручки на сегодня\n"
+        "/setplan YYYY-MM-DD <сумма> – установить план на дату\n"
+        "/getplan [YYYY-MM-DD] – показать план (по умолчанию сегодня)\n\n"
+        "Аналитика и отчёты по Ozon/WB запускаются через кнопки меню."
+    )
+    await update.message.reply_text(text)
+
 
 # ================== MAIN ==================
 
@@ -896,6 +1180,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("adduser", add_user))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("setplan", setplan_command))
+    app.add_handler(CommandHandler("getplan", getplan_command))
 
     # кнопки
     app.add_handler(CallbackQueryHandler(button_handler))
@@ -903,24 +1190,36 @@ def main():
     # обычный текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # 🔔 Периодическая проверка FBS заказов (каждые 60 сек, первый запуск через 10 сек)
+    # 🔔 Периодические задачи
     if app.job_queue is not None:
+        # FBS-пуши раз в минуту
         app.job_queue.run_repeating(
             check_fbs_orders_job,
             interval=60,
             first=10,
-            name="check_fbs_orders",
         )
 
-        # 🔔 Ежедневный отчёт по заказам за прошедший день
-        # Время можешь подправить под себя (по времени сервера)
-        app.job_queue.run_daily(
-            daily_orders_summary_job,
-            time=dtime(hour=21, minute=55),  # например, 21:55 по времени сервера
-            name="daily_orders_summary",
+        # Ежедневный финансовый отчёт.
+        # Считаем задержку до ближайших 8:00 МСК и дальше каждые 24 часа.
+        now_utc = datetime.now(timezone.utc)
+        now_msk = now_utc + timedelta(hours=3)
+        today_msk = now_msk.date()
+        first_run_msk = datetime.combine(today_msk, datetime.min.time()).replace(
+            hour=8, minute=0
+        )
+        if now_msk >= first_run_msk:
+            first_run_msk += timedelta(days=1)
+        delay_seconds = (first_run_msk - now_msk).total_seconds()
+
+        app.job_queue.run_repeating(
+            daily_finance_summary_job,
+            interval=24 * 60 * 60,
+            first=delay_seconds,
         )
     else:
-        logger.warning("JobQueue не инициализировался — фоновые задачи работать не будут.")
+        logger.warning(
+            "JobQueue не инициализировался — фоновые задачи работать не будут."
+        )
 
     app.run_polling()
 
