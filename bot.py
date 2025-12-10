@@ -1008,7 +1008,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny_access(update, context)
 
     query = update.callback_query
-    await query.answer()
+    await query.answer()  # базовый ответ, чтобы Telegram не висел
 
     chat_id = query.message.chat_id
     data = query.data
@@ -1040,15 +1040,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("ozon_orders_"):
         days = int(data.split("_")[-1])
 
+        # 🔔 Показать индикатор ожидания
+        wait_msg = await query.message.reply_text(
+            f"⏳ Строю отчёт по заказам Ozon за последние {days} дн...\n"
+            f"Это может занять до нескольких секунд."
+        )
+
         result = fetch_fbs_orders_grouped(days)
         if not result["ok"]:
-            await query.message.reply_text(
-                f"Ошибка при получении заказов: {result['error']}"
+            await wait_msg.edit_text(
+                f"⚠ Ошибка при получении заказов: {result['error']}"
             )
             return
 
+        # обновляем индикатор и шлём отчёт
+        await wait_msg.edit_text("✅ Отчёт готов. Отправляю данные ниже...")
         report_text = format_orders_report(days, result["data"])
         await send_long_html_message(chat_id, report_text, context)
+
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1067,8 +1076,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = user_state.get(chat_id)
 
     if state == STATE_OZON:
+        # индикатор ожидания
+        wait_msg = await update.message.reply_text(
+            "⏳ Запрашиваю данные по Ozon, секунду..."
+        )
+
         stats = get_ozon_stats(text)
         msg = format_ozon_stats(text, stats)
+
+        await wait_msg.edit_text("✅ Данные по Ozon получены.")
+
         await update.message.reply_text(msg, parse_mode="HTML")
         await update.message.reply_text(
             "Можешь ввести следующий артикул Ozon.\n"
@@ -1077,8 +1094,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif state == STATE_WB:
+        # индикатор ожидания
+        wait_msg = await update.message.reply_text(
+            "⏳ Считаю примерную аналитику по WB..."
+        )
+
         stats = fake_wb_stats(text)
         msg = format_wb_stats(text, stats)
+
+        await wait_msg.edit_text("✅ Черновая аналитика по WB готова.")
+
         await update.message.reply_text(msg, parse_mode="HTML")
         await update.message.reply_text(
             "Можешь ввести следующий артикул WB.\n"
@@ -1184,11 +1209,21 @@ async def report_yesterday_command(update: Update, context: ContextTypes.DEFAULT
     global ADMIN_CHAT_ID
     ADMIN_CHAT_ID = update.effective_chat.id  # чтобы отчёт пришёл сюда же
 
+    # индикатор ожидания
+    wait_msg = await update.message.reply_text(
+        "⏳ Строю отчёт за вчерашний день (по МСК)..."
+    )
+
     ok = await daily_finance_summary_job(context)
     if ok:
-        await update.message.reply_text("✅ Отчёт за вчерашний день сформирован и отправлен.")
+        await wait_msg.edit_text(
+            "✅ Отчёт за вчерашний день сформирован и отправлен выше."
+        )
     else:
-        await update.message.reply_text("⚠ Не удалось построить отчёт. Смотри сообщение об ошибке выше.")
+        await wait_msg.edit_text(
+            "⚠ Не удалось построить отчёт за вчера. Смотри сообщение об ошибке выше."
+        )
+
 
 
 
