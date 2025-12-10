@@ -1,6 +1,9 @@
 import logging
 import requests
 from collections import defaultdict
+from datetime import date, timedelta, datetime, timezone
+import json
+import os
 
 from telegram import (
     Update,
@@ -15,9 +18,44 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from datetime import date, timedelta, datetime, timezone
 
 from gs_client import get_cost_by_article, get_unit_economy_by_article
+
+
+# ================== WHITELIST ==================
+
+WHITELIST_FILE = "allowed_users.json"
+
+
+def load_whitelist():
+    if not os.path.exists(WHITELIST_FILE):
+        return {"owner": "", "allowed": []}
+    with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_whitelist(data):
+    with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+whitelist = load_whitelist()
+
+
+def is_allowed(update: Update) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    username = user.username
+    if not username:
+        return False
+    return username in whitelist.get("allowed", [])
+
+
+async def deny_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Для сообщений
+    if update.message:
+        await update.message.reply_text("❌ У вас нет доступа к этому боту.")
 
 
 # ================== КОНФИГ ==================
@@ -524,7 +562,9 @@ def format_orders_report(days: int, grouped_data: dict) -> str:
         cost_total = cost * qty
 
         # EBITDA
-        ebitda_unit = sell_price - (commission_per_unit + logistics + storage + extra + cost)
+        ebitda_unit = sell_price - (
+            commission_per_unit + logistics + storage + extra + cost
+        )
         ebitda_total = ebitda_unit * qty
 
         total_revenue += revenue
@@ -579,13 +619,9 @@ async def send_long_html_message(
     buf = ""
 
     for p in paragraphs:
-        if buf:
-            candidate = buf + "\n\n" + p
-        else:
-            candidate = p
+        candidate = (buf + "\n\n" + p) if buf else p
 
         if len(candidate) > max_len:
-            # отправляем накопленное и начинаем новый буфер
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=buf,
@@ -608,11 +644,25 @@ async def send_long_html_message(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /start — запоминаем ADMIN_CHAT_ID и показываем главное меню.
+    Первый пользователь, кто вызовет /start, станет owner в whitelist.
     """
-    global ADMIN_CHAT_ID
+    global ADMIN_CHAT_ID, whitelist
 
     user = update.effective_user
     chat_id = update.effective_chat.id
+    username = user.username if user else ""
+
+    # Если owner ещё не задан — делаем этим пользователем
+    if not whitelist.get("owner"):
+        whitelist["owner"] = username
+        if username and username not in whitelist["allowed"]:
+            whitelist["allowed"].append(username)
+        save_whitelist(whitelist)
+        logger.info(f"Whitelist owner bootstrap: {username}")
+
+    # проверяем доступ
+    if not is_allowed(update):
+        return await deny_access(update, context)
 
     ADMIN_CHAT_ID = chat_id  # этот чат будет получать пуши по FBS
 
@@ -642,13 +692,53 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /menu — просто выводит главное меню.
     """
+    if not is_allowed(update):
+        return await deny_access(update, context)
+
     chat_id = update.effective_chat.id
     user_state.pop(chat_id, None)
     await show_main_menu(chat_id, context)
 
 
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /adduser username — добавить пользователя в whitelist.
+    Только owner.
+    """
+    global whitelist
+
+    user = update.effective_user
+    if not user:
+        return
+
+    username = user.username or ""
+    if username != whitelist.get("owner"):
+        return await update.message.reply_text("⛔ Команда доступна только владельцу (owner).")
+
+    if len(context.args) != 1:
+        return await update.message.reply_text("Использование: /adduser username")
+
+    new_user = context.args[0].replace("@", "")
+
+    if new_user in whitelist.get("allowed", []):
+        return await update.message.reply_text("⚠ Пользователь уже в списке")
+
+    whitelist.setdefault("allowed", []).append(new_user)
+    save_whitelist(whitelist)
+
+    await update.message.reply_text(f"✅ Пользователь @{new_user} добавлен в whitelist")
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user = update.effective_user
+
+    # проверка доступа для callback-кнопок
+    if not is_allowed(update):
+        if query:
+            await query.answer("Нет доступа", show_alert=True)
+        return
+
     await query.answer()
 
     chat_id = query.message.chat_id
@@ -689,11 +779,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         report_text = format_orders_report(days, result["data"])
-        # тут используем безопасную отправку длинного текста
         await send_long_html_message(chat_id, report_text, context)
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return await deny_access(update, context)
+
     chat_id = update.message.chat_id
     text = update.message.text.strip()
 
@@ -740,6 +832,7 @@ def main():
     # команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(CommandHandler("adduser", add_user))
 
     # кнопки
     app.add_handler(CallbackQueryHandler(button_handler))
