@@ -1,7 +1,7 @@
 import logging
 import requests
 from collections import defaultdict
-from datetime import date, timedelta, datetime, timezone
+from datetime import date, timedelta, datetime, timezone, time as dtime
 import json
 import os
 
@@ -29,7 +29,10 @@ WHITELIST_FILE = "allowed_users.json"
 
 def load_whitelist():
     if not os.path.exists(WHITELIST_FILE):
-        return {"owner": "", "allowed": []}
+        # по умолчанию владелец — твой ник, остальные пусто
+        data = {"owner": "Icekenrok", "allowed": ["Icekenrok"]}
+        save_whitelist(data)
+        return data
     with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -46,16 +49,46 @@ def is_allowed(update: Update) -> bool:
     user = update.effective_user
     if not user:
         return False
-    username = user.username
+    username = (user.username or "").strip()
     if not username:
+        # без ника — не пускаем
         return False
+    # владелец всегда имеет доступ
+    if username == whitelist.get("owner"):
+        return True
     return username in whitelist.get("allowed", [])
 
 
 async def deny_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Для сообщений
+    """Единый отказ в доступе для сообщений и кнопок."""
     if update.message:
         await update.message.reply_text("❌ У вас нет доступа к этому боту.")
+    elif update.callback_query:
+        await update.callback_query.answer("❌ У вас нет доступа к этому боту.", show_alert=True)
+
+
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /adduser @username — только для владельца."""
+    user = update.effective_user
+    username = (user.username or "").strip() if user else ""
+
+    if username != whitelist.get("owner"):
+        return await update.message.reply_text("⛔ Команда доступна только владельцу бота.")
+
+    if len(context.args) != 1:
+        return await update.message.reply_text("Использование: /adduser username (без @ или с @)")
+
+    new_user = context.args[0].replace("@", "").strip()
+    if not new_user:
+        return await update.message.reply_text("Некорректное имя пользователя.")
+
+    if new_user in whitelist.get("allowed", []):
+        return await update.message.reply_text(f"⚠ Пользователь @{new_user} уже есть в whitelist.")
+
+    whitelist["allowed"].append(new_user)
+    save_whitelist(whitelist)
+
+    await update.message.reply_text(f"✅ Пользователь @{new_user} добавлен в whitelist.")
 
 
 # ================== КОНФИГ ==================
@@ -80,7 +113,7 @@ STATE_WB = "waiting_for_wb_artikul"
 
 user_state: dict[int, str] = {}
 
-# чат, в который слать уведомления о новых FBS заказах
+# чат, в который слать уведомления о новых FBS заказах и дневные отчёты
 ADMIN_CHAT_ID: int | None = None
 
 # уже увиденные FBS-постинги (для уведомлений)
@@ -530,13 +563,15 @@ def format_orders_report(days: int, grouped_data: dict) -> str:
     total_extra = 0.0
     total_ebitda = 0.0
 
+    profitable_skus = []  # товары с ebitda_unit > 0
+    loss_skus = []        # товары с ebitda_unit < 0
+
     for offer_id, info in grouped_data.items():
         name = info["name"]
         qty = info["qty"]
 
         ue = get_unit_economy_by_article(offer_id)
         if ue is None:
-            # если строки нет в таблице — просто показываем qty
             lines.append(
                 f"<b>{offer_id}</b> · {name}\n"
                 f"  Кол-во: {qty} шт\n"
@@ -562,9 +597,7 @@ def format_orders_report(days: int, grouped_data: dict) -> str:
         cost_total = cost * qty
 
         # EBITDA
-        ebitda_unit = sell_price - (
-            commission_per_unit + logistics + storage + extra + cost
-        )
+        ebitda_unit = sell_price - (commission_per_unit + logistics + storage + extra + cost)
         ebitda_total = ebitda_unit * qty
 
         total_revenue += revenue
@@ -574,6 +607,27 @@ def format_orders_report(days: int, grouped_data: dict) -> str:
         total_storage += storage_total
         total_extra += extra_total
         total_ebitda += ebitda_total
+
+        if ebitda_unit > 0:
+            profitable_skus.append(
+                {
+                    "offer_id": offer_id,
+                    "name": name,
+                    "qty": qty,
+                    "ebitda_unit": ebitda_unit,
+                    "ebitda_total": ebitda_total,
+                }
+            )
+        elif ebitda_unit < 0:
+            loss_skus.append(
+                {
+                    "offer_id": offer_id,
+                    "name": name,
+                    "qty": qty,
+                    "ebitda_unit": ebitda_unit,
+                    "ebitda_total": ebitda_total,
+                }
+            )
 
         lines.append(
             f"<b>{offer_id}</b> · {name}\n"
@@ -589,6 +643,7 @@ def format_orders_report(days: int, grouped_data: dict) -> str:
             f"  EBITDA всего: {ebitda_total:.2f} ₽\n"
         )
 
+    # Итоги по суммам
     lines.append(
         "\n<b>Итого по отчёту:</b>\n"
         f"Выручка: {total_revenue:.2f} ₽\n"
@@ -599,6 +654,31 @@ def format_orders_report(days: int, grouped_data: dict) -> str:
         f"Доп. расходы: {total_extra:.2f} ₽\n"
         f"<b>EBITDA (до налогов): {total_ebitda:.2f} ₽</b>"
     )
+
+    # Блок по товарам в плюс/минус
+    lines.append("\n<b>Статистика по товарам:</b>")
+    lines.append(
+        f"Товаров в плюс: {len(profitable_skus)}\n"
+        f"Товаров в минус: {len(loss_skus)}"
+    )
+
+    if profitable_skus:
+        lines.append("\n<b>Товары в плюс:</b>")
+        for sku in sorted(profitable_skus, key=lambda x: x["ebitda_total"], reverse=True):
+            lines.append(
+                f"• <b>{sku['offer_id']}</b> · {sku['name']}\n"
+                f"  Кол-во: {sku['qty']} шт\n"
+                f"  EBITDA/шт: {sku['ebitda_unit']:.2f} ₽, всего: {sku['ebitda_total']:.2f} ₽"
+            )
+
+    if loss_skus:
+        lines.append("\n<b>Товары в минус:</b>")
+        for sku in sorted(loss_skus, key=lambda x: x["ebitda_total"]):
+            lines.append(
+                f"• <b>{sku['offer_id']}</b> · {sku['name']}\n"
+                f"  Кол-во: {sku['qty']} шт\n"
+                f"  EBITDA/шт: {sku['ebitda_unit']:.2f} ₽, всего: {sku['ebitda_total']:.2f} ₽"
+            )
 
     return "\n".join(lines)
 
@@ -619,9 +699,13 @@ async def send_long_html_message(
     buf = ""
 
     for p in paragraphs:
-        candidate = (buf + "\n\n" + p) if buf else p
+        if buf:
+            candidate = buf + "\n\n" + p
+        else:
+            candidate = p
 
         if len(candidate) > max_len:
+            # отправляем накопленное и начинаем новый буфер
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=buf,
@@ -639,32 +723,45 @@ async def send_long_html_message(
         )
 
 
+# =============== ЕЖЕДНЕВНЫЙ ОТЧЁТ В КОНЦЕ ДНЯ ===============
+
+async def daily_orders_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Джоб: раз в день формирует отчёт за последние 1 день
+    и шлёт его владельцу (ADMIN_CHAT_ID).
+    """
+    global ADMIN_CHAT_ID
+    if not ADMIN_CHAT_ID:
+        return
+
+    result = fetch_fbs_orders_grouped(days=1)
+    if not result["ok"]:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"⚠ Ошибка при получении дневного отчёта: {result['error']}",
+        )
+        return
+
+    report_text = format_orders_report(1, result["data"])
+    await send_long_html_message(ADMIN_CHAT_ID, report_text, context)
+
+
 # ================== HANDLERS ==================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /start — запоминаем ADMIN_CHAT_ID и показываем главное меню.
-    Первый пользователь, кто вызовет /start, станет owner в whitelist.
+    Проверяем доступ.
     """
-    global ADMIN_CHAT_ID, whitelist
+    global ADMIN_CHAT_ID
 
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    username = user.username if user else ""
-
-    # Если owner ещё не задан — делаем этим пользователем
-    if not whitelist.get("owner"):
-        whitelist["owner"] = username
-        if username and username not in whitelist["allowed"]:
-            whitelist["allowed"].append(username)
-        save_whitelist(whitelist)
-        logger.info(f"Whitelist owner bootstrap: {username}")
-
-    # проверяем доступ
     if not is_allowed(update):
         return await deny_access(update, context)
 
-    ADMIN_CHAT_ID = chat_id  # этот чат будет получать пуши по FBS
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    ADMIN_CHAT_ID = chat_id  # этот чат будет получать пуши по FBS и дневные отчёты
 
     user_state.pop(chat_id, None)
 
@@ -700,45 +797,11 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(chat_id, context)
 
 
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /adduser username — добавить пользователя в whitelist.
-    Только owner.
-    """
-    global whitelist
-
-    user = update.effective_user
-    if not user:
-        return
-
-    username = user.username or ""
-    if username != whitelist.get("owner"):
-        return await update.message.reply_text("⛔ Команда доступна только владельцу (owner).")
-
-    if len(context.args) != 1:
-        return await update.message.reply_text("Использование: /adduser username")
-
-    new_user = context.args[0].replace("@", "")
-
-    if new_user in whitelist.get("allowed", []):
-        return await update.message.reply_text("⚠ Пользователь уже в списке")
-
-    whitelist.setdefault("allowed", []).append(new_user)
-    save_whitelist(whitelist)
-
-    await update.message.reply_text(f"✅ Пользователь @{new_user} добавлен в whitelist")
-
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = update.effective_user
-
-    # проверка доступа для callback-кнопок
     if not is_allowed(update):
-        if query:
-            await query.answer("Нет доступа", show_alert=True)
-        return
+        return await deny_access(update, context)
 
+    query = update.callback_query
     await query.answer()
 
     chat_id = query.message.chat_id
@@ -846,9 +909,18 @@ def main():
             check_fbs_orders_job,
             interval=60,
             first=10,
+            name="check_fbs_orders",
+        )
+
+        # 🔔 Ежедневный отчёт по заказам за прошедший день
+        # Время можешь подправить под себя (по времени сервера)
+        app.job_queue.run_daily(
+            daily_orders_summary_job,
+            time=dtime(hour=21, minute=55),  # например, 21:55 по времени сервера
+            name="daily_orders_summary",
         )
     else:
-        logger.warning("JobQueue не инициализировался — уведомления FBS работать не будут.")
+        logger.warning("JobQueue не инициализировался — фоновые задачи работать не будут.")
 
     app.run_polling()
 
