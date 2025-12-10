@@ -514,14 +514,15 @@ def _get_msk_yesterday() -> date:
     return yesterday_msk
 
 
-async def daily_finance_summary_job(context: ContextTypes.DEFAULT_TYPE):
+async def daily_finance_summary_job(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Раз в день считает выручку и EBITDA за прошедшие 24 часа
     (приближенно к календарному дню по МСК) на основе FBS-заказов + юнит-экономики.
+    Возвращает True при успехе, False при ошибке.
     """
     global ADMIN_CHAT_ID
     if not ADMIN_CHAT_ID:
-        return
+        return False
 
     target_date = _get_msk_yesterday()
 
@@ -532,7 +533,7 @@ async def daily_finance_summary_job(context: ContextTypes.DEFAULT_TYPE):
             chat_id=ADMIN_CHAT_ID,
             text=f"⚠ Ошибка при получении заказов для ежедневного отчёта: {result['error']}",
         )
-        return
+        return False
 
     summary = calc_ebitda_summary_from_grouped(result["data"])
     offer_stats = summary["offer_stats"]
@@ -604,6 +605,8 @@ async def daily_finance_summary_job(context: ContextTypes.DEFAULT_TYPE):
 
     text = "\n".join(lines)
     await send_long_html_message(ADMIN_CHAT_ID, text, context)
+    return True
+
 
 # ================== ОТЧЁТ ПО ЗАКАЗАМ ЗА ПЕРИОД ==================
 
@@ -1170,6 +1173,24 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
+async def report_yesterday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /report_yesterday — принудительно построить отчёт за вчерашний день (по МСК)
+    и прислать его в этот чат.
+    """
+    if not is_allowed(update):
+        return await deny_access(update, context)
+
+    global ADMIN_CHAT_ID
+    ADMIN_CHAT_ID = update.effective_chat.id  # чтобы отчёт пришёл сюда же
+
+    ok = await daily_finance_summary_job(context)
+    if ok:
+        await update.message.reply_text("✅ Отчёт за вчерашний день сформирован и отправлен.")
+    else:
+        await update.message.reply_text("⚠ Не удалось построить отчёт. Смотри сообщение об ошибке выше.")
+
+
 
 # ================== MAIN ==================
 
@@ -1183,6 +1204,8 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("setplan", setplan_command))
     app.add_handler(CommandHandler("getplan", getplan_command))
+    app.add_handler(CommandHandler("report_yesterday", report_yesterday_command))
+
 
     # кнопки
     app.add_handler(CallbackQueryHandler(button_handler))
