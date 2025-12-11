@@ -26,6 +26,7 @@ from gs_client import get_cost_by_article, get_unit_economy_by_article
 
 WHITELIST_FILE = "allowed_users.json"
 PLAN_FILE = "sales_plan.json"
+ADMIN_CHAT_FILE = "admin_chat.json"
 
 
 def load_plans():
@@ -44,6 +45,31 @@ def save_plans(plans: dict):
 
 
 plans = load_plans()
+
+def load_admin_chat_id() -> int | None:
+    """
+    Читаем chat_id админа из файла, чтобы не терялся после рестартов.
+    """
+    if not os.path.exists(ADMIN_CHAT_FILE):
+        return None
+    try:
+        with open(ADMIN_CHAT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("admin_chat_id")
+    except Exception as e:
+        logger.error(f"Failed to load admin chat id: {e}")
+        return None
+
+
+def save_admin_chat_id(chat_id: int):
+    """
+    Сохраняем chat_id админа в файл.
+    """
+    try:
+        with open(ADMIN_CHAT_FILE, "w", encoding="utf-8") as f:
+            json.dump({"admin_chat_id": chat_id}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save admin chat id: {e}")
 
 
 def set_plan_for_date(target_date: date, value: float):
@@ -144,7 +170,9 @@ STATE_WB = "waiting_for_wb_artikul"
 user_state: dict[int, str] = {}
 
 # чат, в который слать уведомления о новых FBS заказах и дневные отчёты
-ADMIN_CHAT_ID: int | None = None
+# чат, в который слать уведомления о новых FBS заказах и дневные отчёты
+ADMIN_CHAT_ID: int | None = load_admin_chat_id()
+
 
 # уже увиденные FBS-постинги (для уведомлений)
 KNOWN_FBS_POSTINGS: set[str] = set()
@@ -450,6 +478,9 @@ def fetch_new_fbs_postings(hours_back: int = 1):
 
 
 def format_fbs_notification(posting: dict) -> str:
+    """
+    Уведомление о новом FBS-заказе + прикидка юнит-экономики по каждому товару.
+    """
     posting_number = posting.get("posting_number", "—")
     order_number = posting.get("order_number", "—")
     status = posting.get("status", "—")
@@ -457,17 +488,80 @@ def format_fbs_notification(posting: dict) -> str:
     products = posting.get("products", []) or []
 
     lines = []
+    total_revenue = 0.0
+    total_commission = 0.0
+    total_logistics = 0.0
+    total_storage = 0.0
+    total_extra = 0.0
+    total_cost = 0.0
+    total_ebitda = 0.0
+
     for prod in products:
         name = prod.get("name") or prod.get("offer_id") or "Товар"
-        offer_id = prod.get("offer_id", "")
-        qty = prod.get("quantity", 0)
+        offer_id = (prod.get("offer_id") or "").strip()
+        qty = prod.get("quantity", 0) or 0
+
         line = f"• {name}"
         if offer_id:
             line += f" ({offer_id})"
         line += f" — {qty} шт"
+
+        # Юнит-экономика
+        ue = get_unit_economy_by_article(offer_id) if offer_id else None
+        if ue is not None and qty > 0:
+            sell_price = ue.get("sell_price") or 0.0
+            commission_per_unit = ue.get("commission") or 0.0
+            logistics = ue.get("logistics") or 0.0
+            storage = ue.get("storage") or 0.0
+            extra = ue.get("extra") or 0.0
+            cost = ue.get("cost") or 0.0
+
+            revenue = sell_price * qty
+            commission_total = commission_per_unit * qty
+            logistics_total = logistics * qty
+            storage_total = storage * qty
+            extra_total = extra * qty
+            cost_total = cost * qty
+
+            ebitda_unit = sell_price - (
+                commission_per_unit + logistics + storage + extra + cost
+            )
+            ebitda_total = ebitda_unit * qty
+
+            total_revenue += revenue
+            total_commission += commission_total
+            total_logistics += logistics_total
+            total_storage += storage_total
+            total_extra += extra_total
+            total_cost += cost_total
+            total_ebitda += ebitda_total
+
+            line += (
+                f"\n   Цена: {sell_price:.2f} ₽/шт, выручка: {revenue:.2f} ₽"
+                f"\n   Комиссия: {commission_total:.2f} ₽, логистика: {logistics_total:.2f} ₽"
+                f"\n   Хранение: {storage_total:.2f} ₽, доп.: {extra_total:.2f} ₽"
+                f"\n   Себестоимость: {cost_total:.2f} ₽"
+                f"\n   EBITDA по позиции: {ebitda_total:.2f} ₽"
+            )
+        else:
+            line += "\n   ⚠ Нет данных юнит-экономики по этому товару"
+
         lines.append(line)
 
-    products_block = "\n".join(lines) if lines else "Без списка товаров"
+    products_block = "\n\n".join(lines) if lines else "Без списка товаров"
+
+    total_lines = []
+    if products:
+        total_lines.append("<b>Итого по заказу (по юнит-экономике):</b>")
+        total_lines.append(f"Выручка: {total_revenue:.2f} ₽")
+        total_lines.append(f"Комиссия: {total_commission:.2f} ₽")
+        total_lines.append(f"Логистика: {total_logistics:.2f} ₽")
+        total_lines.append(f"Хранение: {total_storage:.2f} ₽")
+        total_lines.append(f"Доп. расходы: {total_extra:.2f} ₽")
+        total_lines.append(f"Себестоимость: {total_cost:.2f} ₽")
+        total_lines.append(f"<b>EBITDA по заказу: {total_ebitda:.2f} ₽</b>")
+
+    totals_block = "\n".join(total_lines) if total_lines else ""
 
     text = (
         f"🆕 Новый заказ FBS\n\n"
@@ -476,7 +570,13 @@ def format_fbs_notification(posting: dict) -> str:
         f"<b>Статус:</b> {status}\n\n"
         f"<b>Товары:</b>\n{products_block}"
     )
+
+    if totals_block:
+        text += "\n\n" + totals_block
+
     return text
+
+
 
 
 async def check_fbs_orders_job(context: ContextTypes.DEFAULT_TYPE):
@@ -968,6 +1068,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     ADMIN_CHAT_ID = chat_id  # этот чат будет получать пуши по FBS и дневные отчёты
+    save_admin_chat_id(chat_id)
+
 
     user_state.pop(chat_id, None)
 
